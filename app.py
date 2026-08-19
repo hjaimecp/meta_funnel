@@ -388,6 +388,31 @@ for col in required_meta:
 # 6. FECHAS
 # ============================================================
 
+def add_iso_week_columns(df, date_col="fecha"):
+    """
+    Agrega columnas ISO dinámicas a cualquier dataframe con fecha.
+    No depende de un catálogo fijo: cada nuevo día queda asignado
+    automáticamente a su año/semana ISO correspondiente.
+    """
+    out = df.copy()
+    dates = pd.to_datetime(out[date_col], errors="coerce")
+    iso = dates.dt.isocalendar()
+
+    out["iso_year"] = iso["year"].astype("Int64")
+    out["iso_week"] = iso["week"].astype("Int64")
+    out["semana_iso"] = np.where(
+        dates.notna(),
+        out["iso_year"].astype(str) + "-W" + out["iso_week"].astype(str).str.zfill(2),
+        pd.NA
+    )
+
+    # Inicio/fin teórico de la semana ISO. Sirve para reconocer semanas
+    # parciales cuando el filtro maestro corta lunes o domingo.
+    out["inicio_semana_iso"] = dates - pd.to_timedelta(dates.dt.weekday, unit="D")
+    out["fin_semana_iso"] = out["inicio_semana_iso"] + pd.Timedelta(days=6)
+    return out
+
+
 # Meta:
 # El CSV puede traer fechas en más de un formato.
 # Se intenta primero DD/MM/YYYY (formato habitual del reporte de Meta)
@@ -477,6 +502,14 @@ lista_registros["fecha"] = pd.to_datetime(
     errors="coerce",
     dayfirst=False
 ).dt.normalize()
+
+
+# Semanas ISO dinámicas para Meta y Zoho.
+# Se vuelven a calcular en cada recarga, por lo que funcionan también
+# para los nuevos días que se agreguen a los archivos.
+meta = add_iso_week_columns(meta, "fecha")
+DT_Leads = add_iso_week_columns(DT_Leads, "fecha")
+lista_registros = add_iso_week_columns(lista_registros, "fecha")
 
 
 # ============================================================
@@ -2905,70 +2938,57 @@ with tab_journey:
 
     st.caption(
         'Base: Fuente de Posible cliente ∈ {"Facebook Ads", "FacebookAds"}. '
-        "MQL se elimina de este dashboard alterno."
+        "Las semanas se calculan con el estándar ISO y se actualizan automáticamente."
     )
 
+    funnel_order = ["Registros", "SQL", "En proceso de venta", "Cierre"]
+
+    def build_conversion_table_from_journey(journey_dict):
+        counts = {stage: len(journey_dict[stage]) for stage in funnel_order}
+        base_n = counts["Registros"]
+        rows = []
+        previous_n = None
+        for stage in funnel_order:
+            n = counts[stage]
+            simple = 100.0 if previous_n is None and n > 0 else safe_div(n, previous_n, 100)
+            accumulated = safe_div(n, base_n, 100)
+            rows.append({
+                "Etapa": stage,
+                "Leads": n,
+                "Conversión simple": simple,
+                "Conversión acumulada": accumulated,
+            })
+            previous_n = n
+        return pd.DataFrame(rows)
+
+    def add_master_non_date_filters(df):
+        out = df.copy()
+        if selected_ads:
+            ids = set()
+            for ad_name in selected_ads:
+                ids.update(name_to_ids.get(ad_name, []))
+            out = out[out["ad_id"].isin(ids)].copy()
+        if selected_sizes:
+            out = out[
+                out["Tamaño de la empresa"].astype(str).str.strip().isin(selected_sizes)
+            ].copy()
+        return out
+
     # ========================================================
-    # FUNNEL PRINCIPAL + TASAS DE CONVERSIÓN GENERALES
+    # FUNNEL PRINCIPAL
     # ========================================================
     st.divider()
     st.subheader("Funnel de Lead Journey")
 
-    funnel_order = ["Registros", "SQL", "En proceso de venta", "Cierre"]
-    funnel_counts = {
-        "Registros": registros_n,
-        "SQL": sql_n,
-        "En proceso de venta": proceso_n,
-        "Cierre": cierre_n,
-    }
-
-    # Conversión simple = etapa actual / etapa inmediatamente anterior.
-    # Conversión acumulada = etapa actual / Registros.
-    conversion_rows = []
-    previous_stage = None
-
-    for stage in funnel_order:
-        current_n = funnel_counts[stage]
-
-        if previous_stage is None:
-            simple_rate = 100.0 if current_n > 0 else np.nan
-        else:
-            previous_n = funnel_counts[previous_stage]
-            simple_rate = safe_div(current_n, previous_n, mult=100)
-
-        accumulated_rate = safe_div(
-            current_n,
-            registros_n,
-            mult=100
-        )
-
-        conversion_rows.append(
-            {
-                "Etapa": stage,
-                "Leads": current_n,
-                "Conversión simple": simple_rate,
-                "Conversión acumulada": accumulated_rate,
-            }
-        )
-
-        previous_stage = stage
-
-    conversion_table = pd.DataFrame(conversion_rows)
-
-    # Texto del funnel general: muestra la conversión SIMPLE en cada etapa.
-    funnel_text = []
-    for _, row in conversion_table.iterrows():
-        simple_txt = (
-            f"{row['Conversión simple']:.2f}%"
-            if pd.notna(row["Conversión simple"])
-            else "—"
-        )
-        funnel_text.append(
-            f"{int(row['Leads']):,}<br>{simple_txt} vs etapa anterior"
-        )
+    conversion_table = build_conversion_table_from_journey(journey)
+    funnel_counts = dict(zip(conversion_table["Etapa"], conversion_table["Leads"]))
+    funnel_text = [
+        f"{int(r['Leads']):,}<br>" +
+        (f"{r['Conversión simple']:.2f}% vs etapa anterior" if pd.notna(r["Conversión simple"]) else "—")
+        for _, r in conversion_table.iterrows()
+    ]
 
     col_funnel, col_rules = st.columns([2.2, 1])
-
     with col_funnel:
         fig_general_funnel = go.Figure(
             go.Funnel(
@@ -2976,164 +2996,146 @@ with tab_journey:
                 x=[funnel_counts[s] for s in funnel_order],
                 text=funnel_text,
                 textinfo="text",
-                customdata=np.column_stack(
-                    [
-                        conversion_table["Conversión simple"].to_numpy(),
-                        conversion_table["Conversión acumulada"].to_numpy(),
-                    ]
-                ),
+                customdata=np.column_stack([
+                    conversion_table["Conversión simple"].to_numpy(),
+                    conversion_table["Conversión acumulada"].to_numpy(),
+                ]),
                 hovertemplate=(
-                    "Etapa: %{y}<br>"
-                    "Leads: %{x}<br>"
+                    "Etapa: %{y}<br>Leads: %{x}<br>"
                     "Conversión simple: %{customdata[0]:.2f}%<br>"
-                    "Conversión acumulada: %{customdata[1]:.2f}%"
-                    "<extra></extra>"
+                    "Conversión acumulada: %{customdata[1]:.2f}%<extra></extra>"
                 ),
             )
         )
-
-        fig_general_funnel.update_layout(
-            height=560,
-            margin=dict(l=20, r=90, t=20, b=20)
-        )
-
-        st.plotly_chart(
-            fig_general_funnel,
-            use_container_width=True
-        )
+        fig_general_funnel.update_layout(height=560, margin=dict(l=20, r=90, t=20, b=20))
+        st.plotly_chart(fig_general_funnel, use_container_width=True)
 
     with col_rules:
         st.markdown("### Reglas generales")
         st.markdown(
             f"""
-- **Registros:** todos los registros de `DT_Leads` después de filtros maestros.
+- **Registros:** todos los registros después de filtros maestros.
 - **SQL:** `Estado de Posible cliente = {SQL_HANDSHAKE}`.
-- **En proceso de venta:** primero cumple SQL y luego `Stage` pertenece al catálogo comercial definido.
-- **Cierre:** primero cumple SQL y luego `Stage = {CLOSE_STAGE}`.
+- **En proceso de venta:** cumple SQL y `Stage` pertenece al catálogo comercial.
+- **Cierre:** cumple SQL y `Stage = {CLOSE_STAGE}`.
 - **Conversión simple:** etapa actual ÷ etapa anterior.
 - **Conversión acumulada:** etapa actual ÷ Registros.
-- **MQL:** eliminado de este dashboard alterno.
             """
         )
 
-    st.markdown("### Tasas de conversión generales")
-
-    conversion_display = conversion_table.copy()
-    conversion_display["Conversión simple"] = conversion_display[
-        "Conversión simple"
-    ].map(lambda x: f"{x:.2f}%" if pd.notna(x) else "—")
-    conversion_display["Conversión acumulada"] = conversion_display[
-        "Conversión acumulada"
-    ].map(lambda x: f"{x:.2f}%" if pd.notna(x) else "—")
-
-    st.dataframe(
-        conversion_display,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Etapa": st.column_config.TextColumn("Etapa"),
-            "Leads": st.column_config.NumberColumn("Leads", format="%d"),
-            "Conversión simple": st.column_config.TextColumn(
-                "% simple (vs etapa anterior)"
-            ),
-            "Conversión acumulada": st.column_config.TextColumn(
-                "% acumulado (desde Registros)"
-            ),
-        },
-    )
-
-    # El cierre se define por el Stage actual, mientras "En proceso de venta"
-    # contiene únicamente stages comerciales activos. Si un lead ya cerró,
-    # deja de estar en "En proceso de venta"; por eso el cociente simple
-    # proceso -> cierre debe interpretarse como relación entre stocks actuales,
-    # no como una cohorte histórica de transición.
-    if proceso_n > 0 and cierre_n > proceso_n:
-        st.warning(
-            "El número de cierres supera a los leads actualmente 'En proceso de venta'. "
-            "Esto puede ocurrir porque Cierre y En proceso se clasifican por Stage actual. "
-            "Para una tasa histórica estricta En proceso → Cierre se necesita historial "
-            "de cambios de etapa por lead."
-        )
-
-    st.markdown("### Funnel por anuncio")
+    # ========================================================
+    # TASAS SEMANALES ISO
+    # ========================================================
+    st.markdown("### Tasas de conversión generales por semana ISO")
     st.caption(
-        "Este gráfico conserva el desglose por anuncio. "
-        "La tabla y el funnel anteriores son los totales generales con los filtros activos."
+        "Cada fila usa la semana ISO de la fecha de creación del lead. "
+        "Si el rango maestro empieza o termina a mitad de semana, esa semana se incluye igualmente "
+        "y se marca como parcial. Las semanas nuevas aparecen automáticamente al agregar nuevos días."
     )
 
-    ads_journey = sorted(
-        leads_f["ad_name"].dropna().astype(str).unique()
-    )
-    fig_lead_funnel = go.Figure()
-
-    for ad in ads_journey:
-        values = []
-        hover_details = []
-
-        for stage in funnel_order:
-            stage_df = journey[stage][
-                journey[stage]["ad_name"] == ad
-            ].copy()
-            values.append(len(stage_df))
-
-            if stage == "Cierre" and not stage_df.empty:
-                detail_lines = []
-                for _, r in stage_df.iterrows():
-                    lead_id = (
-                        str(r.get(LEAD_ID_COL, "—"))
-                        if LEAD_ID_COL is not None
-                        else "—"
-                    )
-                    importe = money(r.get("importe_num", np.nan))
-                    detail_lines.append(
-                        f"ID: {lead_id} · Importe: {importe}"
-                    )
-                hover_details.append("<br>".join(detail_lines))
-            else:
-                hover_details.append("")
-
-        fig_lead_funnel.add_trace(
-            go.Funnel(
-                name=ad,
-                y=funnel_order,
-                x=values,
-                customdata=np.array(hover_details, dtype=object),
-                textinfo="value+percent initial",
-                hovertemplate=(
-                    "Anuncio: %{fullData.name}<br>"
-                    "Etapa: %{y}<br>"
-                    "Leads: %{x}<br>"
-                    "%{customdata}"
-                    "<extra></extra>"
-                )
-            )
+    weekly_rows = []
+    if not leads_f.empty:
+        week_keys = (
+            leads_f[["iso_year", "iso_week", "semana_iso", "inicio_semana_iso", "fin_semana_iso"]]
+            .dropna(subset=["iso_year", "iso_week"])
+            .drop_duplicates()
+            .sort_values(["iso_year", "iso_week"])
         )
+        for _, wk in week_keys.iterrows():
+            wk_base = leads_f[
+                (leads_f["iso_year"] == wk["iso_year"]) &
+                (leads_f["iso_week"] == wk["iso_week"])
+            ].copy()
+            wk_journey = lead_stages(wk_base)
+            wk_conv = build_conversion_table_from_journey(wk_journey)
+            observed_start = max(start_ts, pd.Timestamp(wk["inicio_semana_iso"]))
+            observed_end = min(end_ts, pd.Timestamp(wk["fin_semana_iso"]))
+            partial = (observed_start > pd.Timestamp(wk["inicio_semana_iso"])) or (observed_end < pd.Timestamp(wk["fin_semana_iso"]))
+            for _, row in wk_conv.iterrows():
+                weekly_rows.append({
+                    "Semana ISO": wk["semana_iso"],
+                    "Semana": int(wk["iso_week"]),
+                    "Inicio ISO": pd.Timestamp(wk["inicio_semana_iso"]).date(),
+                    "Fin ISO": pd.Timestamp(wk["fin_semana_iso"]).date(),
+                    "Días observados": f"{observed_start.strftime('%d/%m/%Y')} – {observed_end.strftime('%d/%m/%Y')}",
+                    "Semana parcial": "Sí" if partial else "No",
+                    **row.to_dict(),
+                })
 
-    fig_lead_funnel.update_layout(
-        height=620,
-        legend_title_text="Anuncio",
-        margin=dict(l=20, r=20, t=20, b=20)
-    )
-    st.plotly_chart(
-        fig_lead_funnel,
-        use_container_width=True
-    )
+    weekly_conversion = pd.DataFrame(weekly_rows)
+    if weekly_conversion.empty:
+        st.info("No hay semanas disponibles para los filtros actuales.")
+    else:
+        weekly_display = weekly_conversion.copy()
+        weekly_display["Conversión simple"] = weekly_display["Conversión simple"].map(lambda x: f"{x:.2f}%" if pd.notna(x) else "—")
+        weekly_display["Conversión acumulada"] = weekly_display["Conversión acumulada"].map(lambda x: f"{x:.2f}%" if pd.notna(x) else "—")
+        st.dataframe(weekly_display, use_container_width=True, hide_index=True)
 
     # ========================================================
-    # PASTELES: PERFILAMIENTO Y VENTAS
+    # FUNNEL POR ANUNCIO — PERIODO MAESTRO
+    # ========================================================
+    st.markdown("### Funnel por anuncio · periodo maestro")
+
+    def plot_ad_funnel(base_df, journey_dict, title=None):
+        ads = sorted(base_df["ad_name"].dropna().astype(str).unique())
+        if not ads:
+            st.info("No hay anuncios disponibles para construir el funnel.")
+            return
+        fig = go.Figure()
+        for ad in ads:
+            values = [len(journey_dict[stage][journey_dict[stage]["ad_name"] == ad]) for stage in funnel_order]
+            fig.add_trace(go.Funnel(name=ad, y=funnel_order, x=values, textinfo="value+percent initial"))
+        fig.update_layout(height=620, legend_title_text="Anuncio", title=title, margin=dict(l=20,r=20,t=50,b=20))
+        st.plotly_chart(fig, use_container_width=True)
+
+    plot_ad_funnel(leads_f, journey)
+
+    # ========================================================
+    # FUNNEL COMPARADOR — IGNORA SOLO LA FECHA MAESTRA
+    # ========================================================
+    st.markdown("### Funnel por anuncio · periodo de comparación")
+    st.caption(
+        "Este rango ignora únicamente la fecha del filtro maestro. "
+        "Mantiene los filtros maestros de anuncio y tamaño de empresa para que la comparación sea equivalente."
+    )
+    comparison_dates = st.date_input(
+        "Periodo de comparación",
+        value=(min_date, max_date),
+        min_value=min_date,
+        max_value=max_date,
+        key="journey_comparison_dates"
+    )
+    if isinstance(comparison_dates, (tuple, list)) and len(comparison_dates) == 2:
+        comp_start, comp_end = comparison_dates
+    else:
+        comp_start = comp_end = comparison_dates
+    comp_start_ts = pd.Timestamp(comp_start).normalize()
+    comp_end_ts = pd.Timestamp(comp_end).normalize()
+    comparison_base = DT_Leads_fb[
+        DT_Leads_fb["fecha"].between(comp_start_ts, comp_end_ts, inclusive="both")
+    ].copy()
+    comparison_base = add_master_non_date_filters(comparison_base)
+    comparison_journey = lead_stages(comparison_base)
+    c1, c2 = st.columns(2)
+    with c1:
+        st.metric("Registros comparación", integer(len(comparison_journey["Registros"])))
+    with c2:
+        st.metric("Cierres comparación", integer(len(comparison_journey["Cierre"])))
+    plot_ad_funnel(comparison_base, comparison_journey, title=f"Comparación: {comp_start_ts.strftime('%d/%m/%Y')} – {comp_end_ts.strftime('%d/%m/%Y')}")
+
+    # ========================================================
+    # VENTAS
     # ========================================================
     st.divider()
-    st.subheader("Perfilamiento y Ventas")
+    st.subheader("Ventas")
 
     def show_pie(title, data, reason_col):
         if data.empty:
             st.info(f"{title}: sin datos para los filtros actuales.")
             return
         reasons = (
-            data[reason_col]
-            .fillna("Sin motivo especificado")
-            .astype(str).str.strip().replace("", "Sin motivo especificado")
-            .value_counts().reset_index()
+            data[reason_col].fillna("Sin motivo especificado").astype(str).str.strip()
+            .replace("", "Sin motivo especificado").value_counts().reset_index()
         )
         reasons.columns = ["Motivo", "Leads"]
         fig = px.pie(reasons, names="Motivo", values="Leads", hole=0.48, title=title)
@@ -3142,32 +3144,33 @@ with tab_journey:
 
     p1, p2 = st.columns(2)
     with p1:
-        show_pie(
-            "Perfilamiento",
-            journey["Perfilamiento"],
-            "Estado de Posible cliente"
-        )
+        show_pie("En proceso de venta", journey["En proceso de venta"], "Stage")
     with p2:
-        show_pie(
-            "Ventas",
-            journey["Ventas"],
-            "Stage"
-        )
+        show_pie("Descartes ventas", journey["Ventas"], "Stage")
+
+    # ========================================================
+    # MONTOS — SOLO CIERRES
+    # ========================================================
+    st.divider()
+    st.subheader("Montos")
+    forecast_col = first_existing_col(DT_Leads, ["Pronóstico", "Pronostico", "Forecast", "Previsión", "Prevision"])
+    closed_amounts = journey["Cierre"].copy()
+    amount_table = pd.DataFrame()
+    if not closed_amounts.empty:
+        amount_table["Lead ID"] = closed_amounts[LEAD_ID_COL] if LEAD_ID_COL is not None else closed_amounts.index.astype(str)
+        amount_table["Monto"] = closed_amounts["importe_num"]
+        amount_table["Pronóstico"] = closed_amounts[forecast_col] if forecast_col else "Columna no disponible"
+    st.dataframe(amount_table, use_container_width=True, hide_index=True)
 
     # ========================================================
     # HEATMAP ACUMULADO
     # ========================================================
     st.divider()
     st.subheader("Probabilidad simple acumulada por anuncio")
-    st.caption(
-        "Color = probabilidad acumulada desde Registros. "
-        "Número = cantidad de leads en la etapa."
-    )
-
-    heat_stages = ["Registros", "SQL", "En proceso de venta", "Cierre"]
+    st.caption("Color = probabilidad acumulada desde Registros. Número = cantidad de leads en la etapa.")
+    heat_stages = funnel_order
     ads_heat = sorted(leads_f["ad_name"].dropna().astype(str).unique())
     z_prob, text_count = [], []
-
     for stage in heat_stages:
         probs_row, counts_row = [], []
         for ad in ads_heat:
@@ -3175,65 +3178,27 @@ with tab_journey:
             stage_n = len(journey[stage][journey[stage]["ad_name"] == ad])
             probs_row.append(stage_n / base_n * 100 if base_n > 0 else np.nan)
             counts_row.append(stage_n)
-        z_prob.append(probs_row)
-        text_count.append(counts_row)
-
+        z_prob.append(probs_row); text_count.append(counts_row)
     if ads_heat:
-        fig_heat = go.Figure(
-            data=go.Heatmap(
-                z=z_prob,
-                x=ads_heat,
-                y=heat_stages,
-                text=text_count,
-                texttemplate="%{text}",
-                hovertemplate=(
-                    "Anuncio: %{x}<br>Etapa: %{y}<br>Leads: %{text}<br>"
-                    "Probabilidad acumulada: %{z:.2f}%<extra></extra>"
-                ),
-                zmin=0, zmax=100,
-                colorscale=[
-                    [0.00, "#ffffff"], [0.20, "#fee5d9"],
-                    [0.40, "#fcae91"], [0.60, "#fb6a4a"],
-                    [0.80, "#de2d26"], [1.00, "#a50f15"]
-                ],
-                colorbar=dict(title="Probabilidad %")
-            )
-        )
-        fig_heat.update_yaxes(
-            autorange="reversed",
-            categoryorder="array",
-            categoryarray=heat_stages
-        )
-        fig_heat.update_layout(
-            height=420,
-            xaxis_title="Anuncio",
-            yaxis_title="Etapa",
-            margin=dict(l=20, r=20, t=30, b=20)
-        )
+        fig_heat = go.Figure(data=go.Heatmap(
+            z=z_prob, x=ads_heat, y=heat_stages, text=text_count, texttemplate="%{text}",
+            hovertemplate="Anuncio: %{x}<br>Etapa: %{y}<br>Leads: %{text}<br>Probabilidad acumulada: %{z:.2f}%<extra></extra>",
+            zmin=0, zmax=100, colorscale=[[0,"#ffffff"],[.2,"#fee5d9"],[.4,"#fcae91"],[.6,"#fb6a4a"],[.8,"#de2d26"],[1,"#a50f15"]],
+            colorbar=dict(title="Probabilidad %")
+        ))
+        fig_heat.update_yaxes(autorange="reversed", categoryorder="array", categoryarray=heat_stages)
+        fig_heat.update_layout(height=420, xaxis_title="Anuncio", yaxis_title="Etapa", margin=dict(l=20,r=20,t=30,b=20))
         st.plotly_chart(fig_heat, use_container_width=True)
     else:
         st.info("No hay anuncios disponibles para el heatmap.")
 
-    # ========================================================
-    # TABLAS POR ETAPA + TOTAL
-    # ========================================================
     st.divider()
     st.subheader("Datos filtrados por etapa del funnel")
-
     for stage in ["SQL", "En proceso de venta", "Cierre"]:
         st.markdown(f"### {stage}")
-        st.dataframe(
-            journey[stage].sort_values("fecha", ascending=False),
-            use_container_width=True,
-            hide_index=True
-        )
-
+        st.dataframe(journey[stage].sort_values("fecha", ascending=False), use_container_width=True, hide_index=True)
     st.markdown("### Todos los datos")
-    st.dataframe(
-        leads_f.sort_values("fecha", ascending=False),
-        use_container_width=True,
-        hide_index=True
-    )
+    st.dataframe(leads_f.sort_values("fecha", ascending=False), use_container_width=True, hide_index=True)
 
 
 # ============================================================
@@ -3242,157 +3207,180 @@ with tab_journey:
 
 with tab_profile:
     st.subheader("Perfilamiento-SQL")
-    st.markdown("### Descartes Perfilamiento")
     st.caption(
-        "Esta sección usa DT_Leads y responde a fecha, tamaño de empresa y anuncio "
-        "de los filtros maestros. El filtro de anuncio de esta sección es un refuerzo adicional."
+        "La sección responde a los filtros maestros. Las visualizaciones se segmentan por anuncio; "
+        "SQL mantiene exactamente la misma definición del Lead Journey."
     )
 
-    # Métricas generales: responden únicamente a los filtros maestros.
-    metric_order = [
-        "SQL",
-        "En proceso de perfilamiento",
-        "En transferencia",
-        "Descartes perfilamiento",
-        "Contacto no iniciado",
-    ]
-    profile_groups_master = profiling_groups(leads_f)
-    cols = st.columns(5)
-    for col, group_name in zip(cols, metric_order):
-        col.metric(group_name, integer(len(profile_groups_master[group_name])))
-
-    # Refuerzo por anuncio: se coloca debajo de las métricas generales y
-    # afecta las visualizaciones y tablas de esta sección, no las métricas anteriores.
     profile_ad_options = sorted(leads_f["ad_name"].dropna().astype(str).unique())
     selected_profile_ads = st.multiselect(
-        "Refuerzo por anuncio",
-        options=profile_ad_options,
-        default=[],
-        key="profile_ad_filter",
-        help="Filtro adicional exclusivo de Perfilamiento-SQL; se aplica después de los filtros maestros."
+        "Refuerzo por anuncio", options=profile_ad_options, default=[], key="profile_ad_filter",
+        help="Filtro adicional exclusivo de Perfilamiento-SQL."
     )
-
     profile_base = leads_f.copy()
     if selected_profile_ads:
         profile_base = profile_base[profile_base["ad_name"].isin(selected_profile_ads)].copy()
-
     profile_groups = profiling_groups(profile_base)
 
-    # Pasteles por grupo.
+    # ========================================================
+    # GRUPOS PRINCIPALES — SIN DESCARTES
+    # ========================================================
     st.divider()
-    st.subheader("Distribución por grupo")
+    st.subheader("Estado de Perfilamiento-SQL por anuncio")
+    top_groups = ["SQL", "En proceso de perfilamiento", "En transferencia", "Contacto no iniciado"]
+    group_rows = []
+    for group_name in top_groups:
+        tmp = profile_groups[group_name].groupby("ad_name", dropna=False).size().reset_index(name="Leads")
+        tmp["Etapa"] = group_name
+        group_rows.append(tmp)
+    group_summary = pd.concat(group_rows, ignore_index=True) if group_rows else pd.DataFrame()
+    if group_summary.empty:
+        st.info("No hay datos para los grupos de perfilamiento con los filtros actuales.")
+    else:
+        fig_groups = px.bar(
+            group_summary, x="Etapa", y="Leads", color="ad_name", barmode="group",
+            labels={"ad_name":"Anuncio"}, title="SQL y estados operativos por anuncio"
+        )
+        fig_groups.update_layout(height=500, xaxis_title="Etapa", yaxis_title="Leads")
+        st.plotly_chart(fig_groups, use_container_width=True)
 
-    pie_groups = [
-        ("SQL", profile_groups["SQL"]),
-        ("En proceso de perfilamiento", profile_groups["En proceso de perfilamiento"]),
-        ("En transferencia", profile_groups["En transferencia"]),
-        ("Descartes perfilamiento", profile_groups["Descartes perfilamiento"]),
-        ("Contacto no iniciado", profile_groups["Contacto no iniciado"]),
-    ]
+    # ========================================================
+    # DESCARTES PERFILAMIENTO
+    # ========================================================
+    st.divider()
+    st.subheader("Descartes Perfilamiento")
+    disc = profile_groups["Descartes perfilamiento"].copy()
+    if disc.empty:
+        st.info("No hay descartes de perfilamiento para los filtros actuales.")
+    else:
+        disc_summary = (
+            disc.assign(Motivo=disc["Estado de Posible cliente"].fillna("Sin motivo").astype(str))
+            .groupby(["ad_name", "Motivo"], dropna=False).size().reset_index(name="Leads")
+        )
+        fig_disc = px.bar(
+            disc_summary, x="Motivo", y="Leads", color="ad_name", barmode="group",
+            labels={"ad_name":"Anuncio"}, title="Descartes de perfilamiento por anuncio"
+        )
+        fig_disc.update_layout(height=560, xaxis_tickangle=-35, margin=dict(b=160))
+        st.plotly_chart(fig_disc, use_container_width=True)
 
-    for i in range(0, len(pie_groups), 2):
-        c1, c2 = st.columns(2)
-        for target_col, item in zip([c1, c2], pie_groups[i:i+2]):
-            title, data = item
-            with target_col:
-                show_pie(title, data, "Estado de Posible cliente")
-
-    # Series de tiempo.
+    # ========================================================
+    # EVOLUCIÓN DIARIA
+    # ========================================================
     st.divider()
     st.subheader("Evolución diaria")
     ts1, ts2 = st.columns(2)
-
     with ts1:
-        daily_sql = (
-            profile_groups["SQL"].groupby("fecha").size()
-            .rename("SQL").reset_index()
-        )
-        fig = px.line(
-            daily_sql, x="fecha", y="SQL", markers=True,
-            title="SQL por día"
-        )
+        daily_sql = profile_groups["SQL"].groupby(["fecha", "ad_name"]).size().rename("SQL").reset_index()
+        fig = px.line(daily_sql, x="fecha", y="SQL", color="ad_name", markers=True, title="SQL por día y anuncio")
         fig.update_layout(height=420, xaxis_title="Día", yaxis_title="Leads SQL")
         st.plotly_chart(fig, use_container_width=True)
-
     with ts2:
-        daily_discard = (
-            profile_groups["Descartes perfilamiento"].groupby("fecha").size()
-            .rename("Leads descartados").reset_index()
-        )
-        fig = px.line(
-            daily_discard, x="fecha", y="Leads descartados", markers=True,
-            title="Leads descartados por día"
-        )
-        fig.update_layout(height=420, xaxis_title="Día", yaxis_title="Leads")
-        st.plotly_chart(fig, use_container_width=True)
+        daily_discard = disc.groupby(["fecha", "ad_name"]).size().rename("Leads descartados").reset_index() if not disc.empty else pd.DataFrame()
+        if daily_discard.empty:
+            st.info("Sin descartes diarios.")
+        else:
+            fig = px.line(daily_discard, x="fecha", y="Leads descartados", color="ad_name", markers=True, title="Descartes por día y anuncio")
+            fig.update_layout(height=420, xaxis_title="Día", yaxis_title="Leads")
+            st.plotly_chart(fig, use_container_width=True)
 
-    # Toques: media e IC95% por grupo.
+    # ========================================================
+    # TOQUES DE PERFILAMIENTO + CIERRES, SEGMENTADO POR ANUNCIO
+    # ========================================================
     st.divider()
     st.subheader("Toques de Perfilamiento")
-    st.caption("Media de Conteo e intervalo de confianza aproximado del 95% por grupo.")
-
+    st.caption("Media de Conteo con IC95%, segmentada por anuncio y etapa. Se incluye Cierre.")
+    touch_sources = {
+        "SQL": profile_groups["SQL"],
+        "En proceso de perfilamiento": profile_groups["En proceso de perfilamiento"],
+        "En transferencia": profile_groups["En transferencia"],
+        "Contacto no iniciado": profile_groups["Contacto no iniciado"],
+        "Cierre": lead_stages(profile_base)["Cierre"],
+    }
     touch_rows = []
-    for group_name in metric_order:
-        vals = profile_groups[group_name]["conteo_num"].dropna().astype(float)
-        n = len(vals)
-        mean = vals.mean() if n else np.nan
-        sd = vals.std(ddof=1) if n > 1 else np.nan
-        se = sd / np.sqrt(n) if n > 1 else np.nan
-        ci_low = mean - 1.96 * se if n > 1 else np.nan
-        ci_high = mean + 1.96 * se if n > 1 else np.nan
-        touch_rows.append({
-            "Grupo": group_name,
-            "N": n,
-            "Media": mean,
-            "CI_low": ci_low,
-            "CI_high": ci_high,
-        })
-
+    for stage_name, stage_df in touch_sources.items():
+        for ad, ad_df in stage_df.groupby("ad_name", dropna=False):
+            vals = ad_df["conteo_num"].dropna().astype(float)
+            n = len(vals); mean = vals.mean() if n else np.nan
+            sd = vals.std(ddof=1) if n > 1 else np.nan
+            se = sd / np.sqrt(n) if n > 1 else np.nan
+            touch_rows.append({
+                "Etapa": stage_name, "Anuncio": ad, "N": n, "Media": mean,
+                "CI_low": mean - 1.96*se if n>1 else np.nan,
+                "CI_high": mean + 1.96*se if n>1 else np.nan,
+            })
     touch_summary = pd.DataFrame(touch_rows)
-    valid_touch = touch_summary[touch_summary["N"] > 0].copy()
-
+    valid_touch = touch_summary[touch_summary["N"] > 0].copy() if not touch_summary.empty else pd.DataFrame()
     if valid_touch.empty:
-        st.info("No hay valores numéricos disponibles en la columna Conteo.")
+        st.info("No hay valores numéricos disponibles en Conteo.")
     else:
-        valid_touch["err_plus"] = valid_touch["CI_high"] - valid_touch["Media"]
-        valid_touch["err_minus"] = valid_touch["Media"] - valid_touch["CI_low"]
-        fig_touch = go.Figure(
-            go.Bar(
-                x=valid_touch["Grupo"],
-                y=valid_touch["Media"],
-                error_y=dict(
-                    type="data",
-                    symmetric=False,
-                    array=valid_touch["err_plus"],
-                    arrayminus=valid_touch["err_minus"],
-                    visible=True,
-                ),
-                customdata=valid_touch[["N", "CI_low", "CI_high"]].to_numpy(),
-                hovertemplate=(
-                    "Grupo: %{x}<br>Media: %{y:.2f}<br>N: %{customdata[0]}<br>"
-                    "IC95%: %{customdata[1]:.2f} – %{customdata[2]:.2f}<extra></extra>"
-                )
-            )
+        fig_touch = px.bar(
+            valid_touch, x="Etapa", y="Media", color="Anuncio", barmode="group",
+            custom_data=["N", "CI_low", "CI_high"], title="Toques promedio por anuncio y etapa"
         )
-        fig_touch.update_layout(
-            height=470,
-            xaxis_title="Grupo",
-            yaxis_title="Media de toques",
-            margin=dict(l=20, r=20, t=30, b=100)
-        )
+        fig_touch.update_traces(hovertemplate="Etapa=%{x}<br>Media=%{y:.2f}<br>N=%{customdata[0]}<br>IC95%=%{customdata[1]:.2f} – %{customdata[2]:.2f}<extra></extra>")
+        fig_touch.update_layout(height=500, yaxis_title="Media de toques")
         st.plotly_chart(fig_touch, use_container_width=True)
         st.dataframe(touch_summary, use_container_width=True, hide_index=True)
 
-    # Tablas por grupo.
+    # ========================================================
+    # DÍAS DE OPERACIÓN
+    # ========================================================
+    st.divider()
+    st.subheader("Días de operación")
+    st.caption(
+        "Promedios e IC95% por anuncio. Calificación usa Dias_Lead_a_Calificacion; "
+        "Cierre usa Dias_Opp_a_Cierre."
+    )
+
+    cal_col = first_existing_col(profile_base, ["Dias_Lead_a_Calificacion", "Días_Lead_a_Calificacion", "Dias Lead a Calificacion"])
+    close_col = first_existing_col(profile_base, ["Dias_Opp_a_Cierre", "Días_Opp_a_Cierre", "Dias Opp a Cierre"])
+
+    def operation_summary(df, value_col, metric_name):
+        if value_col is None or df.empty:
+            return pd.DataFrame(columns=["Anuncio","Métrica","N","Promedio","CI_low","CI_high"])
+        temp = df.copy()
+        temp["_dias"] = pd.to_numeric(temp[value_col], errors="coerce")
+        rows=[]
+        for ad, g in temp.groupby("ad_name", dropna=False):
+            vals=g["_dias"].dropna().astype(float); n=len(vals)
+            mean=vals.mean() if n else np.nan; sd=vals.std(ddof=1) if n>1 else np.nan; se=sd/np.sqrt(n) if n>1 else np.nan
+            rows.append({"Anuncio":ad,"Métrica":metric_name,"N":n,"Promedio":mean,
+                         "CI_low":mean-1.96*se if n>1 else np.nan,"CI_high":mean+1.96*se if n>1 else np.nan})
+        return pd.DataFrame(rows)
+
+    op_cal = operation_summary(profile_groups["SQL"], cal_col, "Días a calificación")
+    op_close = operation_summary(lead_stages(profile_base)["Cierre"], close_col, "Días de oportunidad a cierre")
+    op_summary = pd.concat([op_cal, op_close], ignore_index=True)
+    op_valid = op_summary[op_summary["N"] > 0].copy()
+    if op_valid.empty:
+        st.info("No hay datos numéricos disponibles para calcular días de operación.")
+    else:
+        c1, c2 = st.columns(2)
+        for container, metric_name in zip([c1,c2], ["Días a calificación", "Días de oportunidad a cierre"]):
+            with container:
+                dat=op_valid[op_valid["Métrica"]==metric_name].copy()
+                if dat.empty:
+                    st.info(f"{metric_name}: sin datos.")
+                else:
+                    dat["err_plus"] = dat["CI_high"] - dat["Promedio"]
+                    dat["err_minus"] = dat["Promedio"] - dat["CI_low"]
+                    fig=go.Figure(go.Bar(
+                        x=dat["Anuncio"], y=dat["Promedio"],
+                        error_y=dict(type="data", symmetric=False, array=dat["err_plus"], arrayminus=dat["err_minus"], visible=True),
+                        customdata=dat[["N","CI_low","CI_high"]].to_numpy(),
+                        hovertemplate="Anuncio: %{x}<br>Promedio: %{y:.2f} días<br>N: %{customdata[0]}<br>IC95%: %{customdata[1]:.2f} – %{customdata[2]:.2f}<extra></extra>"
+                    ))
+                    fig.update_layout(title=metric_name, height=450, xaxis_title="Anuncio", yaxis_title="Días promedio")
+                    st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(op_summary, use_container_width=True, hide_index=True)
+
+    # Tablas de apoyo
     st.divider()
     st.subheader("Datos por grupo de Perfilamiento-SQL")
-    for group_name in metric_order:
+    for group_name in ["SQL", "En proceso de perfilamiento", "En transferencia", "Contacto no iniciado", "Descartes perfilamiento"]:
         st.markdown(f"### {group_name}")
-        st.dataframe(
-            profile_groups[group_name].sort_values("fecha", ascending=False),
-            use_container_width=True,
-            hide_index=True
-        )
+        st.dataframe(profile_groups[group_name].sort_values("fecha", ascending=False), use_container_width=True, hide_index=True)
 
 # ============================================================
 # ============================================================
